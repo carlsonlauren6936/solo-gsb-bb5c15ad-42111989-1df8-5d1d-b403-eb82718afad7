@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import Depends, FastAPI, Query, Request
@@ -25,6 +26,7 @@ from .schemas import (
     EvaluateBatchRequest,
     EvaluateRequest,
     EvaluationOut,
+    EvaluationStatsOut,
     RecomputeRequest,
     RulesetCreate,
     RulesetMeta,
@@ -97,6 +99,18 @@ def _error(code: str, message: str, status: int, details: dict | None = None) ->
         status_code=status,
         content={"error": {"code": code, "message": message, "details": details or {}}},
     )
+
+
+def _iso_utc_bound(value: datetime | None) -> str | None:
+    """把查询时间归一到 UTC 秒级字符串（与 created_at 存储格式一致，字典序可比较）。
+
+    无时区的输入按 UTC 处理。
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds")
 
 
 # ---------- 工具 ----------
@@ -452,6 +466,35 @@ def list_evaluations(
     if crud.get_ruleset(conn, ruleset_id) is None:
         return _error("NOT_FOUND", f"规则集不存在：{ruleset_id}", 404)
     return crud.list_evaluations(conn, ruleset_id, limit=limit)
+
+
+@app.get(
+    "/api/rulesets/{ruleset_id}/evaluation-stats",
+    response_model=EvaluationStatsOut,
+    tags=["evaluation"],
+    responses={404: {"model": ErrorResponse}},
+)
+def evaluation_stats(
+    ruleset_id: str,
+    version: int | None = Query(None, ge=1, description="只统计指定版本"),
+    since: datetime | None = Query(
+        None, description="起始时间（ISO-8601，含边界；无时区按 UTC 处理）"
+    ),
+    until: datetime | None = Query(
+        None, description="截止时间（ISO-8601，含边界；无时区按 UTC 处理）"
+    ),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> Any:
+    """聚合该规则集已持久化的决策结果（persist=false 的试算不计入）。"""
+    if crud.get_ruleset(conn, ruleset_id) is None:
+        return _error("NOT_FOUND", f"规则集不存在：{ruleset_id}", 404)
+    return crud.evaluation_stats(
+        conn,
+        ruleset_id,
+        version=version,
+        since=_iso_utc_bound(since),
+        until=_iso_utc_bound(until),
+    )
 
 
 @app.get(

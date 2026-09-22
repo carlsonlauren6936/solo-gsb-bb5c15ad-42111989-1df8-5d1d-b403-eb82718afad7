@@ -1,3 +1,6 @@
+from datetime import datetime, timedelta
+
+
 def test_health(client):
     resp = client.get("/health")
     assert resp.status_code == 200
@@ -467,3 +470,169 @@ def test_evaluate_batch_persist_false(client, simple_ruleset_payload):
     assert body["success_count"] == 2
     assert all(item["result"]["id"] == "" for item in body["results"])
     assert client.get(f"/api/rulesets/{rid}/evaluations").json() == []
+
+
+# ---------- 评估统计 ----------
+
+
+def test_evaluation_stats_basic(client, simple_ruleset_payload):
+    rid = client.post("/api/rulesets", json=simple_ruleset_payload).json()["ruleset_id"]
+    # x=42 / x=100 命中 r1+r2，x=1 均不命中
+    for x in (42, 1, 100):
+        resp = client.post(f"/api/rulesets/{rid}/evaluate", json={"document": {"x": x}})
+        assert resp.status_code == 200
+
+    resp = client.get(f"/api/rulesets/{rid}/evaluation-stats")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ruleset_id"] == rid
+    assert body["version"] is None
+    assert body["since"] is None
+    assert body["until"] is None
+    assert body["total_evaluations"] == 3
+    # 按 code 稳定排序；r1/r2 在 3 次决策中各命中 2 次
+    assert body["rule_stats"] == [
+        {"code": "r1", "hit_count": 2, "hit_rate": 0.6667},
+        {"code": "r2", "hit_count": 2, "hit_rate": 0.6667},
+    ]
+    # 决策字段按名称排序，统计出现的决策条数
+    assert body["decision_field_counts"] == [
+        {"field": "bonus", "count": 2},
+        {"field": "level", "count": 2},
+    ]
+
+
+def test_evaluation_stats_version_filter(client, simple_ruleset_payload):
+    rid = client.post("/api/rulesets", json=simple_ruleset_payload).json()["ruleset_id"]
+    client.post(f"/api/rulesets/{rid}/evaluate", json={"document": {"x": 100}})
+    # 收紧为 v2：只剩 r1 且阈值 1000，x=100 不再命中
+    client.put(
+        f"/api/rulesets/{rid}",
+        json={
+            "name": "simple",
+            "rules": [{"code": "r1", "condition": 'doc["x"] >= 1000'}],
+        },
+    )
+    client.post(f"/api/rulesets/{rid}/evaluate", json={"document": {"x": 100}})
+
+    body = client.get(f"/api/rulesets/{rid}/evaluation-stats").json()
+    assert body["total_evaluations"] == 2
+
+    v1 = client.get(f"/api/rulesets/{rid}/evaluation-stats?version=1").json()
+    assert v1["version"] == 1
+    assert v1["total_evaluations"] == 1
+    assert v1["rule_stats"] == [
+        {"code": "r1", "hit_count": 1, "hit_rate": 1.0},
+        {"code": "r2", "hit_count": 1, "hit_rate": 1.0},
+    ]
+    assert v1["decision_field_counts"] == [
+        {"field": "bonus", "count": 1},
+        {"field": "level", "count": 1},
+    ]
+
+    v2 = client.get(f"/api/rulesets/{rid}/evaluation-stats?version=2").json()
+    assert v2["version"] == 2
+    assert v2["total_evaluations"] == 1
+    # 未命中的规则也出现在 traces 中，hit_count 为 0
+    assert v2["rule_stats"] == [{"code": "r1", "hit_count": 0, "hit_rate": 0.0}]
+    assert v2["decision_field_counts"] == []
+
+    # 没有任何记录的版本：零值结构而非 404
+    v9 = client.get(f"/api/rulesets/{rid}/evaluation-stats?version=9").json()
+    assert v9["total_evaluations"] == 0
+    assert v9["rule_stats"] == []
+    assert v9["decision_field_counts"] == []
+
+
+def test_evaluation_stats_since_until(client, simple_ruleset_payload):
+    rid = client.post("/api/rulesets", json=simple_ruleset_payload).json()["ruleset_id"]
+    e1 = client.post(
+        f"/api/rulesets/{rid}/evaluate", json={"document": {"x": 100}}
+    ).json()
+    e2 = client.post(
+        f"/api/rulesets/{rid}/evaluate", json={"document": {"x": 1}}
+    ).json()
+    t1 = datetime.fromisoformat(e1["created_at"])
+    t2 = datetime.fromisoformat(e2["created_at"])
+    assert t1 <= t2
+
+    # 含边界：闭区间 [t1, t2] 覆盖两条记录，并回显归一化后的筛选条件
+    body = client.get(
+        f"/api/rulesets/{rid}/evaluation-stats",
+        params={"since": e1["created_at"], "until": e2["created_at"]},
+    ).json()
+    assert body["total_evaluations"] == 2
+    assert body["since"] == t1.isoformat(timespec="seconds")
+    assert body["until"] == t2.isoformat(timespec="seconds")
+
+    # 边界之外：一条都匹配不到
+    before = (t1 - timedelta(seconds=1)).isoformat()
+    after = (t2 + timedelta(seconds=1)).isoformat()
+    body = client.get(
+        f"/api/rulesets/{rid}/evaluation-stats", params={"until": before}
+    ).json()
+    assert body["total_evaluations"] == 0
+    body = client.get(
+        f"/api/rulesets/{rid}/evaluation-stats", params={"since": after}
+    ).json()
+    assert body["total_evaluations"] == 0
+
+    # 带时区偏移与 Z 结尾都能解析，并归一化为 UTC 秒级字符串
+    body = client.get(
+        f"/api/rulesets/{rid}/evaluation-stats",
+        params={"since": "2000-01-01T08:00:00+08:00", "until": "2999-12-31T23:59:59Z"},
+    ).json()
+    assert body["total_evaluations"] == 2
+    assert body["since"] == "2000-01-01T00:00:00+00:00"
+    assert body["until"] == "2999-12-31T23:59:59+00:00"
+
+
+def test_evaluation_stats_invalid_time_params(client, simple_ruleset_payload):
+    rid = client.post("/api/rulesets", json=simple_ruleset_payload).json()["ruleset_id"]
+    resp = client.get(f"/api/rulesets/{rid}/evaluation-stats?since=not-a-time")
+    assert resp.status_code == 422
+    resp = client.get(f"/api/rulesets/{rid}/evaluation-stats?until=2026-13-40T99:99")
+    assert resp.status_code == 422
+
+
+def test_evaluation_stats_ruleset_not_found(client):
+    resp = client.get("/api/rulesets/nope/evaluation-stats")
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_evaluation_stats_empty_and_unpersisted_ignored(client, simple_ruleset_payload):
+    rid = client.post("/api/rulesets", json=simple_ruleset_payload).json()["ruleset_id"]
+    # persist=false 的试算不计入统计
+    client.post(
+        f"/api/rulesets/{rid}/evaluate?persist=false", json={"document": {"x": 100}}
+    )
+    resp = client.get(f"/api/rulesets/{rid}/evaluation-stats")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total_evaluations"] == 0
+    assert body["rule_stats"] == []
+    assert body["decision_field_counts"] == []
+
+
+def test_evaluation_stats_uses_traces_including_suppressed(client, demo_id):
+    # VIP + 大额：large_order 命中但被 vip_discount 压制；traces 中 hit=true 仍计入
+    client.post(
+        f"/api/rulesets/{demo_id}/evaluate",
+        json={"document": {"amount": 1500, "customer": {"vip": True}, "region": "north"}},
+    )
+    body = client.get(f"/api/rulesets/{demo_id}/evaluation-stats").json()
+    assert body["total_evaluations"] == 1
+    stats = {s["code"]: s for s in body["rule_stats"]}
+    assert stats["large_order"] == {"code": "large_order", "hit_count": 1, "hit_rate": 1.0}
+    assert stats["vip_discount"]["hit_count"] == 1
+    assert stats["manual_review"]["hit_count"] == 0
+    # 全部规则按 code 排序出现
+    assert [s["code"] for s in body["rule_stats"]] == sorted(stats)
+    # 决策字段只统计最终 decision 的顶层字段（被压制的 large_order 字段不计）
+    assert body["decision_field_counts"] == [
+        {"field": "discount", "count": 1},
+        {"field": "free_shipping", "count": 1},
+        {"field": "reason", "count": 1},
+        {"field": "vip", "count": 1},
+    ]

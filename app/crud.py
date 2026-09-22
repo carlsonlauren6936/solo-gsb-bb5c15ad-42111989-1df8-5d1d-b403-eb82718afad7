@@ -310,6 +310,73 @@ def latest_evaluation_document(
     return None if row is None else json.loads(row["document"])
 
 
+def evaluation_stats(
+    conn: sqlite3.Connection,
+    ruleset_id: str,
+    version: int | None = None,
+    since: str | None = None,
+    until: str | None = None,
+) -> dict[str, Any]:
+    """聚合已持久化决策：总数、规则命中（取自 traces）与决策字段出现次数。
+
+    since/until 须为与 created_at 同格式的 UTC 秒级字符串（含边界，字典序
+    即时间序）；结果按规则编码 / 字段名排序，无匹配记录时返回零值结构。
+    """
+    clauses = ["ruleset_id = ?"]
+    params: list[Any] = [ruleset_id]
+    if version is not None:
+        clauses.append("version = ?")
+        params.append(version)
+    if since is not None:
+        clauses.append("created_at >= ?")
+        params.append(since)
+    if until is not None:
+        clauses.append("created_at <= ?")
+        params.append(until)
+    rows = conn.execute(
+        f"SELECT result FROM evaluations WHERE {' AND '.join(clauses)}",
+        params,
+    ).fetchall()
+
+    total = 0
+    hit_counts: dict[str, int] = {}
+    field_counts: dict[str, int] = {}
+    for row in rows:
+        result = json.loads(row["result"])
+        total += 1
+        for trace in result.get("traces") or []:
+            code = trace.get("rule_code")
+            if not code:
+                continue
+            hit_counts.setdefault(code, 0)
+            if trace.get("hit"):
+                hit_counts[code] += 1
+        decision = result.get("decision")
+        if isinstance(decision, dict):
+            for field in decision:
+                field_counts[field] = field_counts.get(field, 0) + 1
+
+    return {
+        "ruleset_id": ruleset_id,
+        "version": version,
+        "since": since,
+        "until": until,
+        "total_evaluations": total,
+        "rule_stats": [
+            {
+                "code": code,
+                "hit_count": count,
+                "hit_rate": round(count / total, 4) if total else 0.0,
+            }
+            for code, count in sorted(hit_counts.items())
+        ],
+        "decision_field_counts": [
+            {"field": field, "count": count}
+            for field, count in sorted(field_counts.items())
+        ],
+    }
+
+
 def _row_to_evaluation(row: sqlite3.Row) -> dict[str, Any]:
     result = json.loads(row["result"])
     document = json.loads(row["document"])

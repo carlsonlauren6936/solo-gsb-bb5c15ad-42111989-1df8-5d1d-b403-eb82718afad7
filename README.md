@@ -183,6 +183,7 @@ SEED_DEMO=1 uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/api/rulesets/{id}/evaluate` | 用最新版（或 `?version=n` 指定旧版）决策，默认持久化结果 |
 | `POST` | `/api/rulesets/{id}/evaluate-batch` | 批量决策（≤100 项），整批固定同一版本，逐项隔离错误 |
 | `GET`  | `/api/rulesets/{id}/evaluations` | 列出该规则集的历史决策结果 |
+| `GET`  | `/api/rulesets/{id}/evaluation-stats` | 聚合已持久化决策：规则命中率与决策字段统计（支持 `version` / `since` / `until` 筛选） |
 | `GET`  | `/api/evaluations/{eval_id}` | 按 ID 查询单次决策结果 |
 | `POST` | `/api/rulesets/{id}/recompute` | 用旧文档对最新版重算（保留旧结果） |
 
@@ -292,6 +293,51 @@ curl -s -X POST localhost:8000/api/rulesets/demo-promotions/evaluate-batch \
 > `status` / `error` 与顶层计数区分成败；仅当规则集或版本不存在等
 > 整批级问题发生时才返回 4xx。
 
+### 评估统计
+
+`GET /api/rulesets/{id}/evaluation-stats` 聚合该规则集**已持久化**的决策结果
+（`persist=false` 的试算与求值失败项均不计入）：
+
+- 可选筛选参数：
+  - `version`：只统计指定规则版本的决策；
+  - `since` / `until`：ISO-8601 时间，按决策创建时间过滤，**含边界**；
+    无时区的输入按 UTC 处理，带偏移的输入会归一到 UTC；
+- `total_evaluations`：筛选后命中的决策条数；
+- `rule_stats`：按规则 `code` 排序。`hit_count` 为 traces 中 `hit=true` 的
+  决策条数（**被冲突策略压制的命中也计入**）；`hit_rate =
+  hit_count / total_evaluations`，保留 4 位小数；
+- `decision_field_counts`：按字段名排序，统计最终 `decision` 的顶层字段
+  在多少条决策中出现；
+- 规则集不存在返回 404（`NOT_FOUND`）；无匹配记录返回零值结构
+  （`total_evaluations` 为 0、两个列表为空）；非法时间参数返回 422。
+
+```bash
+curl -s 'localhost:8000/api/rulesets/demo-promotions/evaluation-stats?since=2026-01-01T00:00:00Z' \
+  | python3 -m json.tool
+```
+
+响应示例：
+
+```json
+{
+  "ruleset_id": "demo-promotions",
+  "version": null,
+  "since": "2026-01-01T00:00:00+00:00",
+  "until": null,
+  "total_evaluations": 2,
+  "rule_stats": [
+    {"code": "free_shipping", "hit_count": 1, "hit_rate": 0.5},
+    {"code": "is_vip", "hit_count": 1, "hit_rate": 0.5},
+    {"code": "large_order", "hit_count": 1, "hit_rate": 0.5},
+    {"code": "vip_discount", "hit_count": 1, "hit_rate": 0.5}
+  ],
+  "decision_field_counts": [
+    {"field": "discount", "count": 1},
+    {"field": "free_shipping", "count": 1}
+  ]
+}
+```
+
 ### 循环依赖被拒绝
 
 ```bash
@@ -314,4 +360,5 @@ pytest -q
 ```
 
 测试覆盖：AST 沙箱安全性、编译校验（重复编码/未知依赖/隐式引用/循环/冲突策略冲突）、
-拓扑排序、定点迭代、三种冲突策略、版本化重算，以及完整 HTTP 接口。
+拓扑排序、定点迭代、三种冲突策略、版本化重算、评估统计聚合（筛选/排序/零值/非法参数），
+以及完整 HTTP 接口。
