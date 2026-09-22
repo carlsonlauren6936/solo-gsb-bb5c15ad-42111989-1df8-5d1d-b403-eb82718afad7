@@ -7,6 +7,8 @@ import sqlite3
 from contextlib import asynccontextmanager
 from typing import Any
 
+from datetime import datetime
+
 from fastapi import Depends, FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
@@ -25,6 +27,7 @@ from .schemas import (
     EvaluateBatchRequest,
     EvaluateRequest,
     EvaluationOut,
+    EvaluationStatsOut,
     RecomputeRequest,
     RulesetCreate,
     RulesetMeta,
@@ -452,6 +455,38 @@ def list_evaluations(
     if crud.get_ruleset(conn, ruleset_id) is None:
         return _error("NOT_FOUND", f"规则集不存在：{ruleset_id}", 404)
     return crud.list_evaluations(conn, ruleset_id, limit=limit)
+
+
+@app.get(
+    "/api/rulesets/{ruleset_id}/evaluation-stats",
+    response_model=EvaluationStatsOut,
+    tags=["evaluation"],
+    responses={404: {"model": ErrorResponse}, 422: {"model": ErrorResponse}},
+)
+def evaluation_stats(
+    ruleset_id: str,
+    version: int | None = Query(None, ge=1, description="只统计该版本的决策"),
+    since: datetime | None = Query(
+        None, description="起始时间（含边界，ISO-8601），如 2026-09-01T00:00:00Z"
+    ),
+    until: datetime | None = Query(
+        None, description="结束时间（含边界，ISO-8601），如 2026-09-30T23:59:59+08:00"
+    ),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> Any:
+    """基于已持久化决策的 traces 聚合统计。
+
+    - `total_evaluations`：筛选命中的决策数；
+    - `rule_stats`：每条规则的命中次数与命中率（分母为 total_evaluations），
+      按 code 字典序排列；
+    - `decision_field_counts`：决策字段出现次数，按字段名字典序排列；
+    - 无匹配记录时返回各字段为零值的结构。
+    """
+    if crud.get_ruleset(conn, ruleset_id) is None:
+        return _error("NOT_FOUND", f"规则集不存在：{ruleset_id}", 404)
+    return crud.evaluation_stats(
+        conn, ruleset_id, version=version, since=since, until=until
+    )
 
 
 @app.get(

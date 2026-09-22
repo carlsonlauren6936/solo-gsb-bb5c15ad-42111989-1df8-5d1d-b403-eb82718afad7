@@ -310,6 +310,73 @@ def latest_evaluation_document(
     return None if row is None else json.loads(row["document"])
 
 
+def _to_utc_second(dt: datetime) -> str:
+    """转为与 created_at 同构的 UTC 秒级 ISO 字符串（含边界按字符串比较）。"""
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt.isoformat(timespec="seconds")
+
+
+def evaluation_stats(
+    conn: sqlite3.Connection,
+    ruleset_id: str,
+    version: int | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+) -> dict[str, Any]:
+    """按 traces 聚合筛选后的已持久化决策。
+
+    时间范围含边界：created_at 与筛选时间均归一化为 UTC 秒级 ISO 字符串，
+    利用其字典序与时间序一致做比较（created_at 索引同样可用）。
+    """
+    sql = "SELECT result FROM evaluations WHERE ruleset_id = ?"
+    params: list[Any] = [ruleset_id]
+    if version is not None:
+        sql += " AND version = ?"
+        params.append(version)
+    if since is not None:
+        sql += " AND created_at >= ?"
+        params.append(_to_utc_second(since))
+    if until is not None:
+        sql += " AND created_at <= ?"
+        params.append(_to_utc_second(until))
+
+    total = 0
+    hit_counts: dict[str, int] = {}
+    field_counts: dict[str, int] = {}
+
+    for row in conn.execute(sql, params):
+        result = json.loads(row["result"])
+        total += 1
+        for trace in result.get("traces", []):
+            code = trace.get("rule_code")
+            if code is None:
+                continue
+            if trace.get("hit"):
+                hit_counts[code] = hit_counts.get(code, 0) + 1
+            else:
+                hit_counts.setdefault(code, 0)
+        for field in (result.get("decision") or {}):
+            field_counts[field] = field_counts.get(field, 0) + 1
+
+    rule_stats = [
+        {
+            "code": code,
+            "hit_count": hit_counts[code],
+            "hit_rate": hit_counts[code] / total if total else 0.0,
+        }
+        for code in sorted(hit_counts)
+    ]
+    return {
+        "ruleset_id": ruleset_id,
+        "total_evaluations": total,
+        "rule_stats": rule_stats,
+        "decision_field_counts": {
+            field: field_counts[field] for field in sorted(field_counts)
+        },
+    }
+
+
 def _row_to_evaluation(row: sqlite3.Row) -> dict[str, Any]:
     result = json.loads(row["result"])
     document = json.loads(row["document"])

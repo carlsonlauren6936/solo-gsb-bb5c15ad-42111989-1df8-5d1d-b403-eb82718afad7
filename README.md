@@ -183,6 +183,7 @@ SEED_DEMO=1 uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/api/rulesets/{id}/evaluate` | 用最新版（或 `?version=n` 指定旧版）决策，默认持久化结果 |
 | `POST` | `/api/rulesets/{id}/evaluate-batch` | 批量决策（≤100 项），整批固定同一版本，逐项隔离错误 |
 | `GET`  | `/api/rulesets/{id}/evaluations` | 列出该规则集的历史决策结果 |
+| `GET`  | `/api/rulesets/{id}/evaluation-stats` | 按版本/时间筛选，聚合命中与决策字段统计 |
 | `GET`  | `/api/evaluations/{eval_id}` | 按 ID 查询单次决策结果 |
 | `POST` | `/api/rulesets/{id}/recompute` | 用旧文档对最新版重算（保留旧结果） |
 
@@ -292,6 +293,52 @@ curl -s -X POST localhost:8000/api/rulesets/demo-promotions/evaluate-batch \
 > `status` / `error` 与顶层计数区分成败；仅当规则集或版本不存在等
 > 整批级问题发生时才返回 4xx。
 
+### 评估统计
+
+`GET /api/rulesets/{id}/evaluation-stats` 对**已持久化**的决策（`persist=false`
+的不入库、不计入）按 `traces` 做聚合，支持以下可选查询参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `version` | 只统计指定规则版本下的决策（如 `version=2`） |
+| `since` | 起始时间，**含边界**，ISO-8601（如 `2026-09-01T00:00:00Z`） |
+| `until` | 结束时间，**含边界**，ISO-8601（如 `2026-09-30T23:59:59+08:00`） |
+
+- 时间可带时区偏移（`Z` / `+08:00` 等），服务端统一按 UTC 比较；不带时区按 UTC 处理；
+- 规则集不存在返回 HTTP 404（`NOT_FOUND`）；
+- 时间参数无法解析为 ISO-8601（或 `version` 非正整数）返回 HTTP 422；
+- 规则集存在但**无匹配记录**（含指定了尚无决策的版本）返回零值结构而非 404。
+
+响应字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `total_evaluations` | 筛选条件命中的决策总数 |
+| `rule_stats` | 每条规则的 `code`、`hit_count`（命中次数）、`hit_rate`（= `hit_count / total_evaluations`），按 `code` 字典序排列；决策中出现过但从未命中的规则也以 0 命中列出 |
+| `decision_field_counts` | `decision` 中每个字段在决策里出现的次数，按字段名字典序排列 |
+
+```bash
+# 统计 2026 年 9 月、版本 1 的全部决策
+curl -s 'localhost:8000/api/rulesets/demo-promotions/evaluation-stats?version=1&since=2026-09-01T00:00:00Z&until=2026-09-30T23:59:59Z' \
+  | python3 -m json.tool
+```
+
+响应示例（无匹配记录时为零值结构）：
+
+```json
+{
+  "ruleset_id": "demo-promotions",
+  "total_evaluations": 3,
+  "rule_stats": [
+    {"code": "free_shipping", "hit_count": 1, "hit_rate": 0.3333333333333333},
+    {"code": "is_vip", "hit_count": 2, "hit_rate": 0.6666666666666666},
+    {"code": "large_order", "hit_count": 1, "hit_rate": 0.3333333333333333},
+    {"code": "manual_review", "hit_count": 0, "hit_rate": 0.0}
+  ],
+  "decision_field_counts": {"discount": 1, "free_shipping": 1, "vip": 2}
+}
+```
+
 ### 循环依赖被拒绝
 
 ```bash
@@ -314,4 +361,4 @@ pytest -q
 ```
 
 测试覆盖：AST 沙箱安全性、编译校验（重复编码/未知依赖/隐式引用/循环/冲突策略冲突）、
-拓扑排序、定点迭代、三种冲突策略、版本化重算，以及完整 HTTP 接口。
+拓扑排序、定点迭代、三种冲突策略、版本化重算、评估统计聚合，以及完整 HTTP 接口。

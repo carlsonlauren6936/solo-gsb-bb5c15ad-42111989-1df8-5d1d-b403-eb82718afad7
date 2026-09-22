@@ -139,6 +139,27 @@ class EvaluationOut(BaseModel):
     created_at: str
 
 
+class RuleStat(BaseModel):
+    code: str = Field(..., description="规则编码（来自决策 traces）")
+    hit_count: int = Field(..., description="命中次数")
+    hit_rate: float = Field(
+        ..., description="命中率 = hit_count / total_evaluations"
+    )
+
+
+class EvaluationStatsOut(BaseModel):
+    ruleset_id: str
+    total_evaluations: int = Field(
+        ..., description="筛选条件命中的已持久化决策总数"
+    )
+    rule_stats: list[RuleStat] = Field(
+        ..., description="各规则命中统计，按 code 字典序排列"
+    )
+    decision_field_counts: dict[str, int] = Field(
+        ..., description="decision 各字段在决策中出现的次数，按字段名字典序排列"
+    )
+
+
 class RecomputeRequest(BaseModel):
     document: Any | None = Field(
         None, description="为空则使用该规则集上一次决策的文档"
